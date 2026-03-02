@@ -1,42 +1,40 @@
-
 const TARGET_URL = "https://cine-hub-blocked.netlify.app";
 
 export default async (request, context) => {
     const url = new URL(request.url);
     const path = url.pathname + url.search;
 
-
+    // 1. OBLITERATE CORS PREFLIGHT CHECKS
     if (request.method === "OPTIONS") {
         return new Response(null, {
             status: 204,
             headers: {
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-                "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
                 "Access-Control-Max-Age": "86400",
             }
         });
     }
 
     let fetchUrl;
-
-
     if (path.startsWith("/___proxy___/")) {
         let actualUrl = path.replace("/___proxy___/", "");
-        actualUrl = actualUrl.replace(/^(https?:\/)([^\/])/, '$1/$2'); // Fix missing slashes
+        actualUrl = actualUrl.replace(/^(https?:\/)([^\/])/, '$1/$2');
         fetchUrl = actualUrl;
     } else {
-        fetchUrl = TARGET_URL + path;
+        fetchUrl = TARGET_URL + (path === "/" ? "" : path);
     }
 
-
+    // 2. PERFECT HEADER SPOOFING
     const headers = new Headers(request.headers);
     try {
         const targetUrlObj = new URL(fetchUrl);
         headers.set("Host", targetUrlObj.host);
         headers.set("Origin", targetUrlObj.origin);
         headers.set("Referer", targetUrlObj.origin + "/");
-        headers.set("User-Agent", request.headers.get("user-agent") || "Mozilla/5.0");
+        headers.set("Sec-Fetch-Site", "same-origin"); // Trick API into thinking we are on the original site
+        headers.delete("X-Forwarded-For");
     } catch(e) {}
 
     const fetchOptions = {
@@ -53,7 +51,7 @@ export default async (request, context) => {
         const response = await fetch(fetchUrl, fetchOptions);
         const newHeaders = new Headers(response.headers);
 
-
+        // 3. HANDLE REDIRECTS
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = newHeaders.get("location");
             if (location) {
@@ -67,11 +65,14 @@ export default async (request, context) => {
             }
         }
 
-
-        newHeaders.delete("x-frame-options");
-        newHeaders.delete("content-security-policy");
-        newHeaders.delete("x-content-type-options");
-        newHeaders.delete("strict-transport-security");
+        // 4. NUKE ALL SECURITY HEADERS
+        const headersToRemove = [
+            "x-frame-options", "content-security-policy", "content-security-policy-report-only",
+            "x-content-type-options", "strict-transport-security", "cross-origin-embedder-policy",
+            "cross-origin-opener-policy", "cross-origin-resource-policy"
+        ];
+        headersToRemove.forEach(h => newHeaders.delete(h));
+        
         newHeaders.set("access-control-allow-origin", "*");
         newHeaders.set("access-control-allow-methods", "*");
         newHeaders.set("access-control-allow-headers", "*");
@@ -79,53 +80,78 @@ export default async (request, context) => {
         let body = response.body;
         const contentType = newHeaders.get("content-type") || "";
 
-
+        // 5. THE ULTIMATE HTML INJECTION
         if (contentType.includes("text/html")) {
             let text = await response.text();
 
-
             text = text.replaceAll(TARGET_URL, url.origin);
-
 
             const injectScript = `
             <script>
+                // A. KILL ALL SERVICE WORKERS (They block our proxy)
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.getRegistrations().then(function(registrations) {
+                        for(let registration of registrations) {
+                            registration.unregister();
+                        }
+                    });
+                    // Prevent site from registering new ones
+                    navigator.serviceWorker.register = async function() { return null; };
+                }
 
+                // B. HOOK FETCH & XHR
                 const originalFetch = window.fetch;
+                const originalOpen = XMLHttpRequest.prototype.open;
+
+                function rewriteUrl(reqUrl) {
+                    try {
+                        if (typeof reqUrl === 'string' && reqUrl.startsWith('http')) {
+                            let targetOrigin = new URL(reqUrl).origin;
+                            if (targetOrigin !== window.location.origin && !reqUrl.includes('/___proxy___/')) {
+                                return '/___proxy___/' + reqUrl;
+                            }
+                        }
+                    } catch(e){}
+                    return reqUrl;
+                }
+
                 window.fetch = async function() {
                     let args = arguments;
                     try {
                         let reqUrl = typeof args[0] === 'string' ? args[0] : args[0].url;
-                        if (reqUrl.startsWith('http')) {
-                            let targetOrigin = new URL(reqUrl).origin;
-                            if (targetOrigin !== window.location.origin && !reqUrl.includes('/___proxy___/')) {
-                                if (typeof args[0] === 'string') {
-                                    args[0] = '/___proxy___/' + args[0];
-                                } else {
-                                    args[0] = new Request('/___proxy___/' + reqUrl, args[0]);
-                                }
-                            }
+                        if (typeof args[0] === 'string') {
+                            args[0] = rewriteUrl(args[0]);
+                        } else {
+                            args[0] = new Request(rewriteUrl(reqUrl), args[0]);
                         }
                     } catch(e){}
                     return originalFetch.apply(this, args);
                 };
 
-                // OVERRIDE XHR (AJAX) TO FORCE THROUGH PROXY
-                const originalOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(method, reqUrl, ...rest) {
-                    try {
-                        if (typeof reqUrl === 'string' && reqUrl.startsWith('http')) {
-                            let targetOrigin = new URL(reqUrl).origin;
-                            if (targetOrigin !== window.location.origin && !reqUrl.includes('/___proxy___/')) {
-                                reqUrl = '/___proxy___/' + reqUrl;
-                            }
-                        }
-                    } catch(e){}
-                    return originalOpen.call(this, method, reqUrl, ...rest);
+                    return originalOpen.call(this, method, rewriteUrl(reqUrl), ...rest);
+                };
+
+                // C. SPOOF [native code] SO ANTI-CHEAT SCRIPTS DON'T CRASH
+                const nativeToString = Function.prototype.toString;
+                Function.prototype.toString = function() {
+                    if (this === window.fetch || this === XMLHttpRequest.prototype.open || this === navigator.serviceWorker.register) {
+                        return "function fetch() { [native code] }";
+                    }
+                    return nativeToString.call(this);
+                };
+
+                // D. HIJACK THE DOM (Catches dynamically created <video src="..."> and <script src="...">)
+                const originalSetAttribute = Element.prototype.setAttribute;
+                Element.prototype.setAttribute = function(name, value) {
+                    if ((name === 'src' || name === 'href') && typeof value === 'string' && value.startsWith('http')) {
+                        value = rewriteUrl(value);
+                    }
+                    return originalSetAttribute.call(this, name, value);
                 };
             </script>
             `;
 
-            // Insert the script safely into the HTML
             if (text.match(/<head>/i)) {
                 text = text.replace(/<head>/i, "<head>\n" + injectScript);
             } else {
@@ -134,7 +160,7 @@ export default async (request, context) => {
             
             body = text;
             newHeaders.delete("content-length");
-            newHeaders.delete("content-encoding"); // Required because we modified the text
+            newHeaders.delete("content-encoding"); 
         }
 
         return new Response(body, {
@@ -143,6 +169,6 @@ export default async (request, context) => {
         });
 
     } catch (error) {
-        return new Response("API/Proxy Error: " + error.message, { status: 500 });
+        return new Response("Proxy Error: " + error.message, { status: 500 });
     }
 };
